@@ -57,6 +57,19 @@ async function postJson(url, body) {
   return data;
 }
 
+async function githubOidcToken() {
+  const requestUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  if (!requestUrl || !requestToken) return null;
+  const separator = requestUrl.includes("?") ? "&" : "?";
+  const response = await fetch(`${requestUrl}${separator}audience=dollyp-source-scan`, {
+    headers: { Authorization: `Bearer ${requestToken}` }
+  });
+  if (!response.ok) throw new Error(`Could not obtain GitHub OIDC token (${response.status})`);
+  const body = await response.json();
+  return body.value || null;
+}
+
 function redact(value) {
   return String(value || "")
     .replace(/AKIA[0-9A-Z]{16}/g, "[REDACTED_AWS_KEY]")
@@ -377,14 +390,17 @@ print(str(count))
 
 async function main() {
   const mode = input("mode", true);
-  const taskToken = input("task-token", true);
+  const taskToken = input("task-token");
+  const scanIdInput = input("scan-id");
   const endpoint = safeEndpoint(input("task-endpoint", true));
   if (!["zip", "repository"].includes(mode)) throw new Error("mode must be zip or repository");
 
   let claim;
   let resultToken;
   try {
-    claim = await postJson(`${endpoint}/source-scan-worker-claim`, { taskToken });
+    const oidcToken = taskToken ? null : await githubOidcToken();
+    if (!taskToken && (!scanIdInput || !oidcToken)) throw new Error("Missing source scan identity");
+    claim = await postJson(`${endpoint}/source-scan-worker-claim`, taskToken ? { taskToken } : { scanId: scanIdInput, oidcToken });
     resultToken = claim.resultToken;
     let root;
     let cleanupRoot;
