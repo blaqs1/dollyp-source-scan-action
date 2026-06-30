@@ -6,7 +6,7 @@ inputs:
     required: true
   task-token:
     description: Opaque one-time DollyP task token
-    required: true
+    required: false
   task-endpoint:
     description: DollyP Edge Function base URL
     required: true

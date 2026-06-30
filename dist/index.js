@@ -28,7 +28,10 @@ const MANIFESTS = new Set([
 ]);
 
 function input(name, required = false) {
-  const value = process.env[`INPUT_${name.toUpperCase().replace(/-/g, "_")}`] || "";
+  const normalized = `INPUT_${name.toUpperCase().replace(/-/g, "_")}`;
+  const raw = `INPUT_${name.toUpperCase()}`;
+  const envName = `DOLLYP_${name.toUpperCase().replace(/-/g, "_")}`;
+  const value = process.env[envName] || process.env[normalized] || process.env[raw] || "";
   if (required && !value.trim()) throw new Error(`Missing required input: ${name}`);
   return value.trim();
 }
