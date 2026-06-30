@@ -1,0 +1,18 @@
+name: DollyP Source Scan
+description: Static source-code scanner for DollyP WebChecker source scans.
+inputs:
+  mode:
+    description: zip or repository
+    required: true
+  task-token:
+    description: Opaque one-time DollyP task token
+    required: true
+  task-endpoint:
+    description: DollyP Edge Function base URL
+    required: true
+  target-path:
+    description: Local repository workspace path for repository mode
+    required: false
+runs:
+  using: node20
+  main: dist/index.js
