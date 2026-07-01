@@ -125,7 +125,7 @@ function commandExists(command) {
   return exists;
 }
 
-function cleanToolError(output) {
+function sanitizeToolOutput(output) {
   return redact(String(output || ""))
     .split(/\r?\n/)
     .filter((line) => line.trim() && !/^\s*(at\s|File\s")/.test(line))
@@ -135,18 +135,78 @@ function cleanToolError(output) {
     .slice(0, 220);
 }
 
+function lineFromOffset(text, offset) {
+  const before = String(text || "").slice(0, Math.max(0, offset));
+  return before.split(/\r?\n/).length;
+}
+
+function lineFromOutput(output) {
+  const text = String(output || "");
+  const patterns = [
+    /line\s+(\d+)/i,
+    /:(\d+):\d+:/,
+    /:(\d+):\s/,
+    /:(\d+)\s/,
+    /\((\d+),\d+\)/
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) return Math.max(1, Number(match[1]) || 1);
+  }
+  return 1;
+}
+
+function toolSyntaxError(output, fallback) {
+  const message = sanitizeToolOutput(output || fallback);
+  return { message: message || fallback, line: lineFromOutput(output) };
+}
+
 function runSyntaxCheck(file, base, ext) {
   if ([".js", ".mjs", ".cjs"].includes(ext)) {
     const result = spawnSync(process.execPath, ["--check", file], { encoding: "utf8", timeout: 10000 });
-    if (result.status !== 0) return cleanToolError(result.stderr || result.stdout || "JavaScript syntax check failed.");
+    if (result.status !== 0) return toolSyntaxError(result.stderr || result.stdout, "JavaScript syntax check failed.");
   }
   if (ext === ".py") {
     const result = spawnSync("python3", ["-m", "py_compile", file], { encoding: "utf8", timeout: 10000 });
-    if (result.status !== 0) return cleanToolError(result.stderr || result.stdout || "Python syntax check failed.");
+    if (result.status !== 0) return toolSyntaxError(result.stderr || result.stdout, "Python syntax check failed.");
   }
   if (/\.(php|inc)$/i.test(base) && commandExists("php")) {
     const result = spawnSync("php", ["-l", file], { encoding: "utf8", timeout: 10000 });
-    if (result.status !== 0) return cleanToolError(result.stderr || result.stdout || "PHP syntax check failed.");
+    if (result.status !== 0) return toolSyntaxError(result.stderr || result.stdout, "PHP syntax check failed.");
+  }
+  if (ext === ".rb" && commandExists("ruby")) {
+    const result = spawnSync("ruby", ["-c", file], { encoding: "utf8", timeout: 10000 });
+    if (result.status !== 0) return toolSyntaxError(result.stderr || result.stdout, "Ruby syntax check failed.");
+  }
+  if (ext === ".sh" && commandExists("bash")) {
+    const result = spawnSync("bash", ["-n", file], { encoding: "utf8", timeout: 10000 });
+    if (result.status !== 0) return toolSyntaxError(result.stderr || result.stdout, "Shell syntax check failed.");
+  }
+  if (ext === ".go" && commandExists("gofmt")) {
+    const result = spawnSync("gofmt", ["-e", "-d", file], { encoding: "utf8", timeout: 10000 });
+    if (result.status !== 0 || /:\d+:\d+:\s/.test(result.stderr || "")) return toolSyntaxError(result.stderr || result.stdout, "Go syntax check failed.");
+  }
+  if (ext === ".json") {
+    try {
+      JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch (error) {
+      const message = error && error.message ? String(error.message) : "JSON syntax check failed.";
+      const position = Number((message.match(/position\s+(\d+)/i) || [])[1]);
+      return {
+        message: sanitizeToolOutput(message),
+        line: Number.isFinite(position) ? lineFromOffset(fs.readFileSync(file, "utf8"), position) : 1
+      };
+    }
+  }
+  if (ext === ".toml") {
+    const script = "import sys,tomllib\ntry:\n  tomllib.load(open(sys.argv[1],'rb'))\nexcept tomllib.TOMLDecodeError as e:\n  print(f'line {getattr(e, \"lineno\", 1)}: {e}', file=sys.stderr)\n  sys.exit(1)\n";
+    const result = spawnSync("python3", ["-c", script, file], { encoding: "utf8", timeout: 10000 });
+    if (result.status !== 0) return toolSyntaxError(result.stderr || result.stdout, "TOML syntax check failed.");
+  }
+  if (ext === ".xml") {
+    const script = "import sys,xml.etree.ElementTree as ET\ntry:\n  ET.parse(sys.argv[1])\nexcept ET.ParseError as e:\n  line = getattr(e, 'position', (1,0))[0]\n  print(f'line {line}: {e}', file=sys.stderr)\n  sys.exit(1)\n";
+    const result = spawnSync("python3", ["-c", script, file], { encoding: "utf8", timeout: 10000 });
+    if (result.status !== 0) return toolSyntaxError(result.stderr || result.stdout, "XML syntax check failed.");
   }
   return null;
 }
@@ -287,8 +347,8 @@ function scanFile(root, file, findings, counters) {
       title: "Source file has a syntax error",
       description: "A safe parser/linter check reported that this file is not syntactically valid. This can break the application before security controls run.",
       path: relative,
-      line: 1,
-      snippet: syntaxError,
+      line: syntaxError.line || 1,
+      snippet: syntaxError.message || "Syntax check failed.",
       fix: "Open the file locally, run the language parser or linter, and fix the syntax error before deployment.",
       verification: "Rerun the language syntax check and then rerun this source scan.",
       references: []
