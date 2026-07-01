@@ -93,6 +93,28 @@ function snippet(line) {
   return redact(line).trim().slice(0, 220);
 }
 
+function readAssignmentExpression(lines, startIndex) {
+  const collected = [];
+  for (let i = startIndex; i < Math.min(lines.length, startIndex + 12); i++) {
+    collected.push(lines[i]);
+    if (/;\s*(?:\/\/.*)?$/.test(lines[i])) break;
+  }
+  return collected.join("\n");
+}
+
+function isStaticInnerHtmlAssignment(lines, startIndex) {
+  const expression = readAssignmentExpression(lines, startIndex);
+  if (!/\.innerHTML\s*=/.test(expression)) return false;
+  if (!/\.innerHTML\s*=\s*`/.test(expression)) return false;
+  if (/\$\{/.test(expression)) return false;
+  return true;
+}
+
+function firstLineMatching(lines, regex) {
+  const index = lines.findIndex((line) => regex.test(line));
+  return index >= 0 ? index + 1 : 1;
+}
+
 function finding(rule, opts) {
   return {
     id: stableId(rule, opts.path || "project", opts.line || 0),
@@ -246,6 +268,85 @@ function scanFile(root, file, findings, counters) {
     }));
   }
 
+  if (/\.(php|inc)$/i.test(base)) {
+    if (/\$DB_USER\s*=\s*['"]root['"]/i.test(text) && /\$DB_PASS\s*=\s*['"]\s*['"]/i.test(text)) {
+      findings.push(finding("db-root-blank-password", {
+        category: "security",
+        severity: "warning",
+        title: "Database config uses root with a blank password",
+        description: "The database configuration uses the root account with an empty password. If this reaches staging or production, database compromise becomes much easier.",
+        path: relative,
+        line: firstLineMatching(lines, /\$DB_PASS\s*=/i),
+        snippet: lines.filter((line) => /\$DB_(USER|PASS)\s*=/.test(line)).join(" "),
+        fix: "Create a dedicated least-privilege database user with a strong password, load credentials from environment variables or server secret storage, and never deploy root/blank database credentials.",
+        verification: "Confirm the deployed config no longer contains root or blank database credentials, then rerun the source scan.",
+        references: []
+      }));
+    }
+
+    if (/die\s*\([^;]*(getMessage\s*\(\)|PDOException|mysqli_connect_error)/is.test(text)) {
+      findings.push(finding("verbose-db-error", {
+        category: "security",
+        severity: "warning",
+        title: "Database error details may be exposed to users",
+        description: "The code can display raw database exception details, which may leak hostnames, table names, SQL errors, or filesystem paths.",
+        path: relative,
+        line: firstLineMatching(lines, /die\s*\(/i),
+        snippet: lines.find((line) => /die\s*\(/i.test(line)) || "",
+        fix: "Log detailed exceptions server-side and show users a generic error message such as 'Service temporarily unavailable'.",
+        verification: "Force a database connection failure in a safe environment and confirm the browser only sees a generic message.",
+        references: []
+      }));
+    }
+
+    if (!counters.csrfReported && /<form\b[^>]*method\s*=\s*['"]?post/i.test(text) && !/(csrf|xsrf|_token|csrf_token)/i.test(text)) {
+      counters.csrfReported = true;
+      findings.push(finding("missing-csrf-token", {
+        category: "security",
+        severity: "warning",
+        title: "POST forms appear to lack CSRF protection",
+        description: "A state-changing POST form was found without an obvious CSRF token or CSRF validation marker. Similar forms may have the same issue.",
+        path: relative,
+        line: firstLineMatching(lines, /<form\b[^>]*method\s*=\s*['"]?post/i),
+        snippet: lines.find((line) => /<form\b[^>]*method\s*=\s*['"]?post/i.test(line)) || "",
+        fix: "Generate a per-session CSRF token, include it as a hidden field in each POST form, and verify it before processing the request.",
+        verification: "Submit the form without the CSRF token in a safe environment and confirm the request is rejected.",
+        references: []
+      }));
+    }
+
+    if (!counters.sessionCookieReported && /session_start\s*\(/i.test(text) && !/(session_set_cookie_params|session\.cookie_httponly|session\.cookie_samesite|session\.cookie_secure)/i.test(text)) {
+      counters.sessionCookieReported = true;
+      findings.push(finding("session-cookie-hardening", {
+        category: "security",
+        severity: "warning",
+        title: "Session cookie security flags are not explicitly configured",
+        description: "The application starts a PHP session without clearly setting HttpOnly, Secure, and SameSite cookie attributes.",
+        path: relative,
+        line: firstLineMatching(lines, /session_start\s*\(/i),
+        snippet: lines.find((line) => /session_start\s*\(/i.test(line)) || "",
+        fix: "Set session cookie parameters before session_start, including httponly=true, secure=true on HTTPS, and samesite=Lax or Strict.",
+        verification: "Inspect the Set-Cookie header after login and confirm HttpOnly, Secure on HTTPS, and SameSite are present.",
+        references: []
+      }));
+    }
+
+    if (/(Demo accounts|password:\s*<code>|password123)/i.test(text)) {
+      findings.push(finding("demo-credentials-exposed", {
+        category: "security",
+        severity: "warning",
+        title: "Demo credentials are exposed in the login page",
+        description: "The login page displays demo usernames and a shared password, which should never be present in a deployed application.",
+        path: relative,
+        line: firstLineMatching(lines, /(Demo accounts|password123)/i),
+        snippet: lines.find((line) => /(Demo accounts|password123)/i.test(line)) || "",
+        fix: "Remove demo credentials from the UI and rotate/delete any demo accounts before deployment.",
+        verification: "Open the login page and confirm no usernames or passwords are displayed.",
+        references: []
+      }));
+    }
+  }
+
   const rules = [
     [/AKIA[0-9A-Z]{16}/, "aws-key", "critical", "AWS access key pattern detected", "A value matching the AWS access key format appears in source code."],
     [/sk_live_[0-9a-zA-Z]{12,}/, "stripe-live-secret", "critical", "Stripe live secret key pattern detected", "A Stripe live secret key appears to be hardcoded."],
@@ -256,7 +357,7 @@ function scanFile(root, file, findings, counters) {
     [/\beval\s*\(/, "eval", "warning", "eval usage detected", "eval executes strings as code and is unsafe with untrusted input."],
     [/\bnew\s+Function\s*\(/, "new-function", "warning", "new Function usage detected", "new Function executes strings as code and is unsafe with untrusted input."],
     [/document\.write\s*\(/, "document-write", "warning", "document.write usage detected", "document.write can create XSS risks when content is influenced by users."],
-    [/\.innerHTML\s*=/, "inner-html", "warning", "innerHTML assignment detected", "Direct innerHTML assignment can introduce XSS when content is not strictly trusted."],
+    [/\.innerHTML\s*=/, "inner-html", "warning", "innerHTML assignment uses dynamic markup", "innerHTML assignment can introduce XSS when the assigned markup includes user-controlled or interpolated content."],
     [/dangerouslySetInnerHTML\s*=\s*\{/, "dangerously-set-html", "warning", "React dangerouslySetInnerHTML usage detected", "dangerouslySetInnerHTML bypasses React escaping and requires sanitizer review."],
     [/(localStorage|sessionStorage)\.(setItem|getItem)\s*\(\s*['"][^'"]*(token|password|secret|jwt|auth)/i, "browser-token-storage", "warning", "Sensitive token stored in browser storage", "Long-lived auth secrets in localStorage/sessionStorage are exposed to XSS."],
     [/Access-Control-Allow-Origin['"]?\s*[:=]\s*['"]\*/i, "cors-wildcard", "warning", "Wildcard CORS configuration detected", "Wildcard CORS can expose APIs more broadly than intended."],
@@ -270,6 +371,7 @@ function scanFile(root, file, findings, counters) {
     const line = lines[index];
     for (const [regex, rule, severity, title, description] of rules) {
       if (regex.test(line)) {
+        if (rule === "inner-html" && isStaticInnerHtmlAssignment(lines, index)) continue;
         const kind = String(rule).includes("secret") || String(rule).includes("key") || String(rule).includes("token") || String(rule).includes("role") ? FIX.secret : String(rule).includes("html") || String(rule).includes("eval") || String(rule).includes("function") || String(rule).includes("write") ? FIX.injection : FIX.config;
         findings.push(finding(rule, {
           category: String(rule).includes("manifest") ? "dependencies" : "security",
@@ -311,8 +413,7 @@ function scan(root) {
       severity: "warning",
       title: ".gitignore file not found",
       description: "No .gitignore was found in the scanned source root, increasing the chance of committing secrets or generated files.",
-      path: ".gitignore",
-      line: 1,
+      path: null,
       fix: "Add a .gitignore containing at least .env, .env.*, node_modules, dist, build, coverage, and local editor files.",
       verification: "Run git check-ignore .env after adding the file.",
       references: ["https://git-scm.com/docs/gitignore"]
