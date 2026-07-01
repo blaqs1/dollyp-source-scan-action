@@ -4,11 +4,14 @@ const path = require("path");
 const crypto = require("crypto");
 const { spawnSync } = require("child_process");
 
-const VERSION = "2026.06.30";
+const VERSION = "2026.07.01";
 const MAX_FILES = 5000;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_FINDINGS = 250;
 const MAX_EXTRACTED_BYTES = 100 * 1024 * 1024;
+const MAX_REVIEW_FILES = 18;
+const MAX_REVIEW_LINES_PER_FILE = 140;
+const MAX_REVIEW_CHARS = 60000;
 const IGNORE_DIRS = new Set([
   "node_modules", ".git", "dist", "build", ".next", "coverage", "vendor",
   "venv", ".venv", "__pycache__", "target", "out", "tmp", ".cache"
@@ -78,6 +81,7 @@ function redact(value) {
     .replace(/gh[pousr]_[0-9A-Za-z]{20,}/g, "[REDACTED_GITHUB_TOKEN]")
     .replace(/FLWSECK_[A-Z]+-[0-9a-zA-Z-]+/g, "[REDACTED_FLUTTERWAVE_SECRET]")
     .replace(/eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}/g, "[REDACTED_JWT]")
+    .replace(/(password\s*(?:for all users\s+is|is|:)\s*)(<code>)?[^<\s'"`]{4,}(<\/code>)?/gi, "$1$2[REDACTED]$3")
     .replace(/((?:password|passwd|secret|token|api[_-]?key|client_secret|service_role)\s*[:=]\s*['"])[^'"]{4,}(['"])/gi, "$1[REDACTED]$2");
 }
 
@@ -290,6 +294,81 @@ function shouldRead(file) {
   const base = path.basename(file);
   const ext = base.toLowerCase() === "dockerfile" ? ".dockerfile" : path.extname(base).toLowerCase();
   return TEXT_EXTS.has(ext) || MANIFESTS.has(base) || base.startsWith(".env") || base === ".gitignore";
+}
+
+function isReviewableFile(file) {
+  const base = path.basename(file);
+  const ext = base.toLowerCase() === "dockerfile" ? ".dockerfile" : path.extname(base).toLowerCase();
+  if (base.startsWith(".env")) return false;
+  if (base.toLowerCase().includes("lock")) return false;
+  if (MANIFESTS.has(base)) return true;
+  return [
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".html", ".htm",
+    ".php", ".py", ".rb", ".go", ".rs", ".java", ".kt", ".cs", ".sh",
+    ".yml", ".yaml", ".toml", ".ini", ".dockerfile", ".conf", ".config", ".sql"
+  ].includes(ext);
+}
+
+function reviewSignalScore(relative, text, findingCount) {
+  let score = findingCount * 10;
+  const lower = relative.toLowerCase();
+  if (/(auth|login|session|user|account|admin|permission|role|policy|guard)/.test(lower)) score += 35;
+  if (/(payment|billing|checkout|invoice|subscription|webhook|refund|transaction)/.test(lower)) score += 32;
+  if (/(api|route|controller|handler|server|middleware|function|endpoint)/.test(lower)) score += 24;
+  if (/(config|secret|env|dockerfile|workflow|schema|migration|sql)/.test(lower)) score += 18;
+  if (/(password|token|secret|csrf|cors|session|auth|role|permission|admin|webhook|payment|sql|query|exec|eval|innerhtml|dangerouslysetinnerhtml)/i.test(text)) score += 18;
+  return score;
+}
+
+function excerptForReview(text) {
+  const lines = text.split(/\r?\n/);
+  const selected = [];
+  const interesting = /(auth|login|password|token|secret|csrf|cors|session|admin|role|permission|payment|billing|webhook|query|sql|exec|eval|innerHTML|dangerouslySetInnerHTML|fetch|axios|form|POST|INSERT|UPDATE|DELETE|SELECT)/i;
+  for (let i = 0; i < lines.length && selected.length < MAX_REVIEW_LINES_PER_FILE; i++) {
+    if (interesting.test(lines[i])) {
+      const start = Math.max(0, i - 8);
+      const end = Math.min(lines.length, i + 14);
+      for (let j = start; j < end && selected.length < MAX_REVIEW_LINES_PER_FILE; j++) {
+        if (!selected.some((entry) => entry.line === j + 1)) selected.push({ line: j + 1, text: redact(lines[j]).slice(0, 260) });
+      }
+    }
+  }
+  if (!selected.length) {
+    for (let i = 0; i < Math.min(lines.length, 60); i++) selected.push({ line: i + 1, text: redact(lines[i]).slice(0, 260) });
+  }
+  return selected.slice(0, MAX_REVIEW_LINES_PER_FILE);
+}
+
+function collectReviewContext(root, files, findings) {
+  const findingCounts = new Map();
+  for (const item of findings) {
+    if (item && item.path) findingCounts.set(item.path, (findingCounts.get(item.path) || 0) + 1);
+  }
+  const candidates = [];
+  for (const file of files.slice(0, MAX_FILES)) {
+    if (!isReviewableFile(file)) continue;
+    let stat;
+    try { stat = fs.statSync(file); } catch { continue; }
+    if (!stat.isFile() || stat.size > 180 * 1024) continue;
+    const buffer = fs.readFileSync(file);
+    if (isBinary(buffer)) continue;
+    const text = buffer.toString("utf8");
+    const relative = rel(root, file);
+    const score = reviewSignalScore(relative, text, findingCounts.get(relative) || 0);
+    if (score <= 0) continue;
+    candidates.push({ path: relative, score, language: path.extname(file).replace(".", "") || path.basename(file), lines: excerptForReview(text) });
+  }
+  candidates.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+  const filesOut = [];
+  let chars = 0;
+  for (const candidate of candidates.slice(0, MAX_REVIEW_FILES * 2)) {
+    const serialized = JSON.stringify({ path: candidate.path, language: candidate.language, lines: candidate.lines });
+    if (chars + serialized.length > MAX_REVIEW_CHARS) break;
+    filesOut.push({ path: candidate.path, language: candidate.language, lines: candidate.lines });
+    chars += serialized.length;
+    if (filesOut.length >= MAX_REVIEW_FILES) break;
+  }
+  return { files: filesOut, truncated: candidates.length > filesOut.length, maxFiles: MAX_REVIEW_FILES, maxLinesPerFile: MAX_REVIEW_LINES_PER_FILE, maxChars: MAX_REVIEW_CHARS };
 }
 
 function walk(root) {
@@ -839,7 +918,8 @@ function scan(root) {
     scanFile(root, file, findings, counters);
     if (findings.length >= MAX_FINDINGS) break;
   }
-  return { findings: findings.slice(0, MAX_FINDINGS), scannedFiles: counters.scanned, skippedFiles: counters.skipped };
+  const finalFindings = findings.slice(0, MAX_FINDINGS);
+  return { findings: finalFindings, reviewContext: collectReviewContext(root, files, finalFindings), scannedFiles: counters.scanned, skippedFiles: counters.skipped };
 }
 
 function validateAndExtractZip(zipPath, outDir) {
@@ -943,6 +1023,7 @@ async function main() {
       resultToken,
       scanId: claim.scanId,
       findings: result.findings,
+      reviewContext: result.reviewContext,
       scannedFiles: result.scannedFiles,
       skippedFiles: result.skippedFiles,
       scannerVersion: VERSION
