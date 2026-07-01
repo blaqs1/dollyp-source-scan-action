@@ -115,6 +115,64 @@ function firstLineMatching(lines, regex) {
   return index >= 0 ? index + 1 : 1;
 }
 
+const COMMAND_EXISTS_CACHE = new Map();
+
+function commandExists(command) {
+  if (COMMAND_EXISTS_CACHE.has(command)) return COMMAND_EXISTS_CACHE.get(command);
+  const result = spawnSync("bash", ["-lc", `command -v ${command}`], { encoding: "utf8", timeout: 5000 });
+  const exists = result.status === 0;
+  COMMAND_EXISTS_CACHE.set(command, exists);
+  return exists;
+}
+
+function cleanToolError(output) {
+  return redact(String(output || ""))
+    .split(/\r?\n/)
+    .filter((line) => line.trim() && !/^\s*(at\s|File\s")/.test(line))
+    .slice(0, 3)
+    .join(" ")
+    .trim()
+    .slice(0, 220);
+}
+
+function runSyntaxCheck(file, base, ext) {
+  if ([".js", ".mjs", ".cjs"].includes(ext)) {
+    const result = spawnSync(process.execPath, ["--check", file], { encoding: "utf8", timeout: 10000 });
+    if (result.status !== 0) return cleanToolError(result.stderr || result.stdout || "JavaScript syntax check failed.");
+  }
+  if (ext === ".py") {
+    const result = spawnSync("python3", ["-m", "py_compile", file], { encoding: "utf8", timeout: 10000 });
+    if (result.status !== 0) return cleanToolError(result.stderr || result.stdout || "Python syntax check failed.");
+  }
+  if (/\.(php|inc)$/i.test(base) && commandExists("php")) {
+    const result = spawnSync("php", ["-l", file], { encoding: "utf8", timeout: 10000 });
+    if (result.status !== 0) return cleanToolError(result.stderr || result.stdout || "PHP syntax check failed.");
+  }
+  return null;
+}
+
+function hasAny(text, patterns) {
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+function lineMatching(lines, regex) {
+  const index = lines.findIndex((line) => typeof regex === "function" ? regex(line) : regex.test(line));
+  return { line: index >= 0 ? index + 1 : 1, text: index >= 0 ? lines[index] : "" };
+}
+
+function unsafePhpEchoLine(line) {
+  const matches = String(line || "").match(/<\?=\s*([\s\S]*?)\s*\?>/g) || [];
+  for (const tag of matches) {
+    const expr = tag.replace(/^<\?=\s*/, "").replace(/\s*\?>$/, "").trim();
+    if (!expr) continue;
+    if (/^(htmlspecialchars|htmlentities|number_format|date|count)\s*\(/i.test(expr)) continue;
+    if (/^\(?\s*(int|float|bool|string)\s*\)?/i.test(expr)) continue;
+    if (/^[0-9\s+\-*/().]+$/.test(expr)) continue;
+    if (/(\$_|\[[^\]]+\]|->)/.test(expr)) return true;
+  }
+  return false;
+}
+
 function finding(rule, opts) {
   return {
     id: stableId(rule, opts.path || "project", opts.line || 0),
@@ -221,6 +279,21 @@ function scanFile(root, file, findings, counters) {
   const text = buffer.toString("utf8");
   counters.scanned++;
   const lines = text.split(/\r?\n/);
+  const syntaxError = runSyntaxCheck(file, base, ext);
+  if (syntaxError) {
+    findings.push(finding("syntax-error", {
+      category: "quality",
+      severity: "warning",
+      title: "Source file has a syntax error",
+      description: "A safe parser/linter check reported that this file is not syntactically valid. This can break the application before security controls run.",
+      path: relative,
+      line: 1,
+      snippet: syntaxError,
+      fix: "Open the file locally, run the language parser or linter, and fix the syntax error before deployment.",
+      verification: "Rerun the language syntax check and then rerun this source scan.",
+      references: []
+    }));
+  }
 
   if (base.startsWith(".env")) {
     findings.push(finding("env-file", {
@@ -284,6 +357,21 @@ function scanFile(root, file, findings, counters) {
       }));
     }
 
+    if (/\$DB_HOST\s*=\s*['"](?:localhost|127\.0\.0\.1)['"]/i.test(text) && /\$DB_(USER|PASS|NAME)\s*=/i.test(text)) {
+      findings.push(finding("local-db-config", {
+        category: "configuration",
+        severity: "info",
+        title: "Local database settings are hardcoded",
+        description: "The app contains localhost database settings directly in code. That is acceptable for a demo, but production deployments should load database connection settings from server-side environment variables.",
+        path: relative,
+        line: firstLineMatching(lines, /\$DB_HOST\s*=/i),
+        snippet: lines.filter((line) => /\$DB_(HOST|USER|PASS|NAME)\s*=/.test(line)).join(" "),
+        fix: "Move database host/name/user/password into environment variables or server secret storage and keep only safe examples in source.",
+        verification: "Confirm production database settings are not hardcoded in the repository and rerun the source scan.",
+        references: []
+      }));
+    }
+
     if (/die\s*\([^;]*(getMessage\s*\(\)|PDOException|mysqli_connect_error)/is.test(text)) {
       findings.push(finding("verbose-db-error", {
         category: "security",
@@ -299,36 +387,64 @@ function scanFile(root, file, findings, counters) {
       }));
     }
 
-    if (!counters.csrfReported && /<form\b[^>]*method\s*=\s*['"]?post/i.test(text) && !/(csrf|xsrf|_token|csrf_token)/i.test(text)) {
-      counters.csrfReported = true;
+    if (!/die\s*\([^;]*(getMessage\s*\(\)|PDOException|mysqli_connect_error)/is.test(text) && /catch\s*\([^)]*(Throwable|Exception|PDOException)[^)]*\)[\s\S]{0,500}(getMessage\s*\(\)|mysqli_error|errorInfo\s*\()/i.test(text)) {
+      counters.verboseExceptionFindings = counters.verboseExceptionFindings || 0;
+      if (counters.verboseExceptionFindings < 8) {
+        counters.verboseExceptionFindings++;
+        const match = lineMatching(lines, /getMessage\s*\(\)|mysqli_error|errorInfo\s*\(/i);
+        findings.push(finding("verbose-exception-message", {
+          category: "security",
+          severity: "warning",
+          title: "Raw exception message may be shown to users",
+          description: "The code catches an exception and appears to place the raw exception message into a user-facing error path. This can leak SQL details, filesystem paths, or stack context.",
+          path: relative,
+          line: match.line,
+          snippet: match.text,
+          fix: "Log the raw exception server-side and show users a generic failure message.",
+          verification: "Trigger the failure path in a safe environment and confirm the browser does not display internal exception text.",
+          references: []
+        }));
+      }
+    }
+
+    if (/<form\b[^>]*method\s*=\s*['"]?post/i.test(text) && !/(csrf|xsrf|_token|csrf_token)/i.test(text)) {
+      counters.csrfFindings = counters.csrfFindings || 0;
+      if (counters.csrfFindings < 10) {
+        counters.csrfFindings++;
+        const match = lineMatching(lines, /<form\b[^>]*method\s*=\s*['"]?post/i);
       findings.push(finding("missing-csrf-token", {
         category: "security",
         severity: "warning",
         title: "POST forms appear to lack CSRF protection",
-        description: "A state-changing POST form was found without an obvious CSRF token or CSRF validation marker. Similar forms may have the same issue.",
+        description: "A state-changing POST form was found without an obvious CSRF token or CSRF validation marker.",
         path: relative,
-        line: firstLineMatching(lines, /<form\b[^>]*method\s*=\s*['"]?post/i),
-        snippet: lines.find((line) => /<form\b[^>]*method\s*=\s*['"]?post/i.test(line)) || "",
+        line: match.line,
+        snippet: match.text,
         fix: "Generate a per-session CSRF token, include it as a hidden field in each POST form, and verify it before processing the request.",
         verification: "Submit the form without the CSRF token in a safe environment and confirm the request is rejected.",
         references: []
       }));
+      }
     }
 
-    if (!counters.sessionCookieReported && /session_start\s*\(/i.test(text) && !/(session_set_cookie_params|session\.cookie_httponly|session\.cookie_samesite|session\.cookie_secure)/i.test(text)) {
-      counters.sessionCookieReported = true;
+    if (/session_start\s*\(/i.test(text) && !/(session_set_cookie_params|session\.cookie_httponly|session\.cookie_samesite|session\.cookie_secure)/i.test(text)) {
+      counters.sessionCookieFindings = counters.sessionCookieFindings || 0;
+      if (counters.sessionCookieFindings < 3) {
+        counters.sessionCookieFindings++;
+        const match = lineMatching(lines, /session_start\s*\(/i);
       findings.push(finding("session-cookie-hardening", {
         category: "security",
         severity: "warning",
         title: "Session cookie security flags are not explicitly configured",
         description: "The application starts a PHP session without clearly setting HttpOnly, Secure, and SameSite cookie attributes.",
         path: relative,
-        line: firstLineMatching(lines, /session_start\s*\(/i),
-        snippet: lines.find((line) => /session_start\s*\(/i.test(line)) || "",
+        line: match.line,
+        snippet: match.text,
         fix: "Set session cookie parameters before session_start, including httponly=true, secure=true on HTTPS, and samesite=Lax or Strict.",
         verification: "Inspect the Set-Cookie header after login and confirm HttpOnly, Secure on HTTPS, and SameSite are present.",
         references: []
       }));
+      }
     }
 
     if (/(Demo accounts|password:\s*<code>|password123)/i.test(text)) {
@@ -345,6 +461,207 @@ function scanFile(root, file, findings, counters) {
         references: []
       }));
     }
+
+    if (/password_verify\s*\(/i.test(text) && !/\b(rate_limit|rate limit|throttle|attempts?|lockout|captcha|too many)\b/i.test(text)) {
+      findings.push(finding("missing-login-rate-limit", {
+        category: "security",
+        severity: "warning",
+        title: "Login flow has no obvious brute-force protection",
+        description: "The login handler verifies passwords but does not show evidence of rate limiting, lockout, captcha, or failed-attempt tracking.",
+        path: relative,
+        line: firstLineMatching(lines, /password_verify\s*\(/i),
+        snippet: lines.find((line) => /password_verify\s*\(/i.test(line)) || "",
+        fix: "Add IP/account-based throttling, failed-attempt tracking, and alerting for repeated failed login attempts.",
+        verification: "Attempt repeated invalid logins in a safe environment and confirm requests are slowed or blocked.",
+        references: []
+      }));
+    }
+
+    if (/\$pdo->query\s*\(\s*(?:["'`][^"'`]*(?:\$\w+|\$_|\{)|[^)]*\.\s*\$_(?:GET|POST|REQUEST)|[^)]*\$_(?:GET|POST|REQUEST))/i.test(text)) {
+      findings.push(finding("possible-sql-injection", {
+        category: "security",
+        severity: "critical",
+        title: "User input may reach a raw SQL query",
+        description: "A raw query call appears to include variable or request-derived SQL. Use prepared statements for all user-controlled values.",
+        path: relative,
+        line: firstLineMatching(lines, /\$pdo->query\s*\(/i),
+        snippet: lines.find((line) => /\$pdo->query\s*\(/i.test(line)) || "",
+        fix: "Replace raw SQL string construction with prepared statements and bound parameters.",
+        verification: "Review this path with malicious input and confirm the SQL query structure cannot change.",
+        references: []
+      }));
+    }
+
+    if (lines.some(unsafePhpEchoLine)) {
+      counters.phpOutputFindings = counters.phpOutputFindings || 0;
+      if (counters.phpOutputFindings < 10) {
+        counters.phpOutputFindings++;
+        const match = lineMatching(lines, unsafePhpEchoLine);
+        findings.push(finding("unescaped-template-output", {
+          category: "security",
+          severity: "warning",
+          title: "Template output may not be HTML-escaped",
+          description: "A PHP short echo appears to output variable data without an escaping helper. If the value can contain user input, this can become stored or reflected XSS.",
+          path: relative,
+          line: match.line,
+          snippet: match.text,
+          fix: "Wrap untrusted output in htmlspecialchars(..., ENT_QUOTES, 'UTF-8') or an equivalent escaping helper.",
+          verification: "Render this template with HTML metacharacters in the underlying data and confirm they are escaped.",
+          references: []
+        }));
+      }
+    }
+  }
+
+  if (ext === ".sql") {
+    if (/(demo|default|sample)\s+(user|account|password|credential)|password123|INSERT\s+INTO\s+users/i.test(text)) {
+      findings.push(finding("seeded-demo-accounts", {
+        category: "security",
+        severity: "warning",
+        title: "SQL seed data includes demo/default accounts",
+        description: "The SQL file appears to create demo or default user accounts. These accounts often survive into staging or production with known credentials.",
+        path: relative,
+        line: firstLineMatching(lines, /(demo|default|sample)\s+(user|account|password|credential)|password123|INSERT\s+INTO\s+users/i),
+        snippet: lines.find((line) => /(demo|default|sample)\s+(user|account|password|credential)|password123|INSERT\s+INTO\s+users/i.test(line)) || "",
+        fix: "Remove demo accounts from production migrations and seed them only in isolated local development fixtures.",
+        verification: "Load the production database seed/migration path and confirm no default admin/demo users are created.",
+        references: []
+      }));
+    }
+    if (/IDENTIFIED\s+BY\s+['"][^'"]+['"]|PASSWORD\s*=\s*['"][^'"]+['"]/i.test(text)) {
+      findings.push(finding("sql-hardcoded-password", {
+        category: "security",
+        severity: "critical",
+        title: "SQL contains a hardcoded password",
+        description: "A SQL script contains a literal password. Database credentials should be provisioned through secrets, not committed SQL.",
+        path: relative,
+        line: firstLineMatching(lines, /IDENTIFIED\s+BY|PASSWORD\s*=/i),
+        snippet: lines.find((line) => /IDENTIFIED\s+BY|PASSWORD\s*=/i.test(line)) || "",
+        ...FIX.secret
+      }));
+    }
+  }
+
+  if ([".py"].includes(ext)) {
+    const pythonRules = [
+      [/DEBUG\s*=\s*True/, "django-debug-true", "warning", "Django DEBUG is enabled", "Django DEBUG=True leaks detailed errors and settings if deployed."],
+      [/ALLOWED_HOSTS\s*=\s*\[[^\]]*['"]\*['"]/, "django-allowed-hosts-wildcard", "warning", "Django ALLOWED_HOSTS allows every host", "Wildcard host acceptance can enable host-header attacks."],
+      [/SECRET_KEY\s*=\s*['"][^'"]{8,}['"]/, "django-hardcoded-secret-key", "critical", "Django SECRET_KEY is hardcoded", "A committed Django secret key can compromise signing and session security."],
+      [/app\.run\s*\([^)]*debug\s*=\s*True/i, "flask-debug-true", "warning", "Flask debug mode is enabled", "Flask debug mode must not be enabled in production."],
+      [/CORS\s*\([^)]*origins\s*=\s*['"]\*['"]/i, "flask-cors-wildcard", "warning", "Wildcard CORS configuration detected", "Wildcard CORS can expose APIs more broadly than intended."],
+      [/subprocess\.(run|Popen|call|check_output)\s*\([^)]*shell\s*=\s*True/i, "python-subprocess-shell", "critical", "subprocess uses shell=True", "shell=True can become command injection when arguments contain user input."],
+      [/\bos\.system\s*\(/, "python-os-system", "warning", "os.system usage detected", "os.system executes shell commands and is risky with dynamic input."],
+      [/pickle\.loads?\s*\(/, "python-pickle-load", "critical", "pickle deserialization detected", "pickle can execute code when loading untrusted data."],
+      [/yaml\.load\s*\([^)]*(?!Loader\s*=)/, "python-unsafe-yaml-load", "warning", "yaml.load without explicit safe loader", "yaml.load can construct unsafe objects unless SafeLoader is used."],
+      [/requests\.[a-z]+\s*\([^)]*verify\s*=\s*False/i, "python-tls-verify-false", "warning", "TLS verification disabled", "Disabling TLS certificate verification allows man-in-the-middle attacks."]
+    ];
+    for (let index = 0; index < lines.length; index++) {
+      const line = lines[index];
+      for (const [regex, rule, severity, title, description] of pythonRules) {
+        if (regex.test(line)) {
+          findings.push(finding(rule, {
+            category: "security",
+            severity,
+            title,
+            description,
+            path: relative,
+            line: index + 1,
+            snippet: line,
+            ...(String(rule).includes("secret") ? FIX.secret : FIX.config)
+          }));
+        }
+      }
+    }
+  }
+
+  if ([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"].includes(ext)) {
+    const jsRules = [
+      [/postMessage\s*\([^,]+,\s*['"]\*['"]/, "postmessage-wildcard", "warning", "postMessage uses wildcard target origin", "Wildcard postMessage targets can leak messages to unexpected origins."],
+      [/target\s*=\s*['"]_blank['"][^>]*(?<!rel\s*=\s*['"][^'"]*noopener[^'"]*['"])/i, "blank-target-no-noopener", "warning", "External blank link may miss noopener", "target=_blank without rel=noopener can allow reverse tabnabbing."],
+      [/(fetch|axios\.[a-z]+)\s*\(\s*['"]http:\/\//i, "insecure-http-request", "warning", "Plain HTTP request detected", "Plain HTTP requests can expose traffic and be modified in transit."],
+      [/Math\.random\s*\(\s*\).*?(token|secret|password|otp|code)|(?:token|secret|password|otp|code).*?Math\.random\s*\(/i, "math-random-secret", "warning", "Math.random used for security-sensitive value", "Math.random is not cryptographically secure for tokens, passwords, OTPs, or reset codes."],
+      [/child_process\.(exec|execSync)\s*\(/, "node-child-process-exec", "warning", "Node child_process exec usage detected", "exec runs shell commands and can become command injection when input is dynamic."],
+      [/res\.send\s*\([^)]*req\.(query|body|params)/i, "express-reflected-input", "warning", "Express response may reflect request input", "Sending request input directly can create reflected XSS or content injection."],
+      [/cors\s*\(\s*\{[^}]*origin\s*:\s*['"]\*['"]/i, "node-cors-wildcard", "warning", "Wildcard CORS configuration detected", "Wildcard CORS can expose APIs more broadly than intended."]
+    ];
+    for (let index = 0; index < lines.length; index++) {
+      const line = lines[index];
+      for (const [regex, rule, severity, title, description] of jsRules) {
+        if (regex.test(line)) {
+          findings.push(finding(rule, {
+            category: "security",
+            severity,
+            title,
+            description,
+            path: relative,
+            line: index + 1,
+            snippet: line,
+            ...FIX.config
+          }));
+        }
+      }
+    }
+  }
+
+  if (base.toLowerCase() === "dockerfile" || ext === ".dockerfile") {
+    if (!/^USER\s+\S+/im.test(text)) {
+      findings.push(finding("dockerfile-no-user", {
+        category: "configuration",
+        severity: "warning",
+        title: "Dockerfile does not set a non-root user",
+        description: "Containers run as root by default unless USER is set. A non-root runtime user limits damage after compromise.",
+        path: relative,
+        line: 1,
+        fix: "Create a dedicated low-privilege user in the image and set USER before the final runtime command.",
+        verification: "Run the container and confirm id -u does not return 0.",
+        references: []
+      }));
+    }
+    if (/ADD\s+https?:\/\//i.test(text)) {
+      findings.push(finding("dockerfile-remote-add", {
+        category: "configuration",
+        severity: "warning",
+        title: "Dockerfile downloads remote content with ADD",
+        description: "ADD from remote URLs can make builds less reproducible and harder to verify.",
+        path: relative,
+        line: firstLineMatching(lines, /ADD\s+https?:\/\//i),
+        snippet: lines.find((line) => /ADD\s+https?:\/\//i.test(line)) || "",
+        fix: "Download verified artifacts with checksum validation in a controlled build step.",
+        verification: "Confirm remote artifacts are pinned and checksum-verified.",
+        references: []
+      }));
+    }
+  }
+
+  if ([".yml", ".yaml"].includes(ext)) {
+    if (/privileged:\s*true/i.test(text)) {
+      findings.push(finding("container-privileged-true", {
+        category: "configuration",
+        severity: "warning",
+        title: "Container privileged mode enabled",
+        description: "privileged: true gives a container broad host-level capabilities and should be avoided unless absolutely required.",
+        path: relative,
+        line: firstLineMatching(lines, /privileged:\s*true/i),
+        snippet: lines.find((line) => /privileged:\s*true/i.test(line)) || "",
+        fix: "Remove privileged mode and grant only the specific Linux capabilities or devices required.",
+        verification: "Confirm the service starts without privileged mode.",
+        references: []
+      }));
+    }
+    if (/secrets:\s*inherit/i.test(text)) {
+      findings.push(finding("github-secrets-inherit", {
+        category: "security",
+        severity: "warning",
+        title: "GitHub Actions workflow inherits all secrets",
+        description: "secrets: inherit can expose more repository or organization secrets than the called workflow needs.",
+        path: relative,
+        line: firstLineMatching(lines, /secrets:\s*inherit/i),
+        snippet: lines.find((line) => /secrets:\s*inherit/i.test(line)) || "",
+        fix: "Pass only the named secrets required by the reusable workflow.",
+        verification: "Inspect the workflow call and confirm only explicitly required secrets are passed.",
+        references: []
+      }));
+    }
   }
 
   const rules = [
@@ -352,17 +669,24 @@ function scanFile(root, file, findings, counters) {
     [/sk_live_[0-9a-zA-Z]{12,}/, "stripe-live-secret", "critical", "Stripe live secret key pattern detected", "A Stripe live secret key appears to be hardcoded."],
     [/gh[pousr]_[0-9A-Za-z]{20,}/, "github-token", "critical", "GitHub token pattern detected", "A GitHub token appears to be hardcoded."],
     [/FLWSECK_[A-Z]+-[0-9a-zA-Z-]+/, "flutterwave-secret", "critical", "Flutterwave secret key pattern detected", "A Flutterwave secret key appears to be hardcoded."],
+    [/-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/, "private-key-material", "critical", "Private key material detected", "A private key block appears to be committed in source code."],
+    [/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/, "jwt-token", "critical", "JWT-like token detected", "A JWT-like token appears in source code and may grant access if still valid."],
     [/service_role[^A-Za-z0-9_-]{0,20}eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/i, "supabase-service-role", "critical", "Supabase service role key exposure risk", "A Supabase service role key appears to be present in source code."],
     [/(password|passwd|secret|token|api[_-]?key|client_secret)\s*[:=]\s*['"][^'"]{8,}['"]/i, "hardcoded-secret", "critical", "Hardcoded credential-like value", "A credential-like assignment appears in source code."],
+    [/https?:\/\/[^'"\s]+:[^'"\s]+@/i, "url-embedded-credentials", "critical", "URL contains embedded credentials", "A URL appears to include username/password credentials."],
     [/\beval\s*\(/, "eval", "warning", "eval usage detected", "eval executes strings as code and is unsafe with untrusted input."],
     [/\bnew\s+Function\s*\(/, "new-function", "warning", "new Function usage detected", "new Function executes strings as code and is unsafe with untrusted input."],
     [/document\.write\s*\(/, "document-write", "warning", "document.write usage detected", "document.write can create XSS risks when content is influenced by users."],
     [/\.innerHTML\s*=/, "inner-html", "warning", "innerHTML assignment uses dynamic markup", "innerHTML assignment can introduce XSS when the assigned markup includes user-controlled or interpolated content."],
     [/dangerouslySetInnerHTML\s*=\s*\{/, "dangerously-set-html", "warning", "React dangerouslySetInnerHTML usage detected", "dangerouslySetInnerHTML bypasses React escaping and requires sanitizer review."],
     [/(localStorage|sessionStorage)\.(setItem|getItem)\s*\(\s*['"][^'"]*(token|password|secret|jwt|auth)/i, "browser-token-storage", "warning", "Sensitive token stored in browser storage", "Long-lived auth secrets in localStorage/sessionStorage are exposed to XSS."],
-    [/Access-Control-Allow-Origin['"]?\s*[:=]\s*['"]\*/i, "cors-wildcard", "warning", "Wildcard CORS configuration detected", "Wildcard CORS can expose APIs more broadly than intended."],
+    [/Access-Control-Allow-Origin['"]?\s*[:=]\s*['"]\*|header\s*\(\s*['"]Access-Control-Allow-Origin:\s*\*/i, "cors-wildcard", "warning", "Wildcard CORS configuration detected", "Wildcard CORS can expose APIs more broadly than intended."],
     [/(md5|sha1)\s*\([^)]*(password|passwd)/i, "weak-password-hash", "critical", "Weak password hashing pattern detected", "MD5/SHA1 are not appropriate for password storage."],
-    [/(debug|devtools)\s*[:=]\s*true/i, "debug-enabled", "info", "Debug/development flag enabled", "Debug settings can leak implementation details if shipped to production."],
+    [/(debug|devtools|display_errors)\s*[:=]\s*true|ini_set\s*\(\s*['"]display_errors['"]\s*,\s*['"]?1/i, "debug-enabled", "warning", "Debug/development flag enabled", "Debug settings can leak implementation details if shipped to production."],
+    [/CURLOPT_SSL_VERIFYPEER\s*,\s*(false|0)|verify\s*[:=]\s*false/i, "tls-verification-disabled", "warning", "TLS verification disabled", "Disabling certificate verification allows man-in-the-middle attacks."],
+    [/chmod\s+777|chmod\s*\([^)]*0777/i, "world-writable-permissions", "warning", "World-writable file permissions detected", "0777 permissions can allow unintended users or processes to modify files."],
+    [/unserialize\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)/i, "php-untrusted-unserialize", "critical", "PHP unserialize uses request input", "unserialize on untrusted input can lead to object injection and code execution."],
+    [/include\s*\(\s*\$_(GET|POST|REQUEST)|require(?:_once)?\s*\(\s*\$_(GET|POST|REQUEST)/i, "php-dynamic-include", "critical", "PHP include/require uses request input", "Including paths from request input can lead to local/remote file inclusion."],
     [/permissions:\s*write-all/i, "github-permissions-write-all", "warning", "GitHub Actions write-all permissions", "Workflow permissions are broader than most scanners need."],
     [/pull_request_target:/i, "github-pr-target", "warning", "pull_request_target workflow trigger detected", "pull_request_target can expose privileged tokens to untrusted pull request code if misused."]
   ];
@@ -372,7 +696,8 @@ function scanFile(root, file, findings, counters) {
     for (const [regex, rule, severity, title, description] of rules) {
       if (regex.test(line)) {
         if (rule === "inner-html" && isStaticInnerHtmlAssignment(lines, index)) continue;
-        const kind = String(rule).includes("secret") || String(rule).includes("key") || String(rule).includes("token") || String(rule).includes("role") ? FIX.secret : String(rule).includes("html") || String(rule).includes("eval") || String(rule).includes("function") || String(rule).includes("write") ? FIX.injection : FIX.config;
+        if (rule === "debug-enabled" && ext === ".py") continue;
+        const kind = String(rule).includes("secret") || String(rule).includes("key") || String(rule).includes("token") || String(rule).includes("role") || String(rule).includes("credential") || String(rule).includes("private") || String(rule).includes("jwt") ? FIX.secret : String(rule).includes("html") || String(rule).includes("eval") || String(rule).includes("function") || String(rule).includes("write") ? FIX.injection : FIX.config;
         findings.push(finding(rule, {
           category: String(rule).includes("manifest") ? "dependencies" : "security",
           severity,
@@ -417,6 +742,37 @@ function scan(root) {
       fix: "Add a .gitignore containing at least .env, .env.*, node_modules, dist, build, coverage, and local editor files.",
       verification: "Run git check-ignore .env after adding the file.",
       references: ["https://git-scm.com/docs/gitignore"]
+    }));
+  }
+  const fileNames = new Set(files.map((file) => path.basename(file)));
+  const firstRelative = (name) => {
+    const matched = files.find((file) => path.basename(file) === name);
+    return matched ? rel(root, matched) : name;
+  };
+  if (fileNames.has("package.json") && !["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"].some((name) => fileNames.has(name))) {
+    findings.push(finding("missing-node-lockfile", {
+      category: "dependencies",
+      severity: "warning",
+      title: "Node project has no lockfile",
+      description: "package.json exists without a recognized package manager lockfile. Builds may install different dependency versions over time.",
+      path: firstRelative("package.json"),
+      line: 1,
+      fix: "Commit the lockfile generated by the package manager used for this project.",
+      verification: "Run the package manager install command locally and confirm the generated lockfile is committed.",
+      references: []
+    }));
+  }
+  if (fileNames.has("composer.json") && !fileNames.has("composer.lock")) {
+    findings.push(finding("missing-composer-lockfile", {
+      category: "dependencies",
+      severity: "warning",
+      title: "Composer project has no lockfile",
+      description: "composer.json exists without composer.lock. Production installs may resolve different dependency versions over time.",
+      path: firstRelative("composer.json"),
+      line: 1,
+      fix: "Commit composer.lock for applications so dependency versions are reproducible.",
+      verification: "Run composer install in a trusted environment and confirm composer.lock is present.",
+      references: []
     }));
   }
   for (const file of files.slice(0, MAX_FILES)) {
